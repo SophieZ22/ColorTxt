@@ -1,3 +1,10 @@
+// sophie
+import { nativeImage } from "electron";
+import { cookieHeaderForUrl } from "./cookieManager";
+import { resolveSourceRequestHeaders } from "./sourceRequestHeaders";
+import { fetchBinaryViaChromiumSession } from "./chromiumNetFetch";
+import { recognizeInlineCharacter } from "./inlineImageOcr";
+
 import type {
   BookSourceRecord,
   SearchBookItem,
@@ -1903,6 +1910,19 @@ async function fetchContentPage(
     .setRuleData({ variable: { ...variables } })
     .setNextChapterUrl(nextChapterUrl);
   let content = await ar.getString(rule.content, body);
+
+  // sophie
+  if (/<img\b/i.test(content)) {
+    content = await replaceInlineCharacterImages(
+      content,
+      contentBaseUrl,
+      source,
+      host,
+      logs,
+    );
+  }
+
+
   if (/<[a-z][\s\S]*>/i.test(content)) {
     content = formatLegadoChapterContent(content);
     if (content.includes("&")) {
@@ -1915,6 +1935,214 @@ async function fetchContentPage(
   }
   return { content, nextUrls };
 }
+
+// sophie{
+async function replaceInlineCharacterImages(
+  html: string,
+  baseUrl: string,
+  source: BookSourceRecord,
+  host: ReturnType<typeof createJsExtensionHost>,
+  logs: string[],
+): Promise<string> {
+  const imgRegex =
+    /<img\b[^>]*src\s*=\s*["']([^"']+)["'][^>]*>/gi;
+
+  const matches = [...html.matchAll(imgRegex)];
+
+  if (matches.length === 0) {
+    return html;
+  }
+
+  let result = html;
+
+  for (const match of matches) {
+    const fullTag = match[0];
+    const rawSrc = match[1];
+
+    if (!rawSrc) continue;
+
+    if (!result.includes(fullTag)) continue;
+
+    try {
+      const imageUrl = new URL(rawSrc, baseUrl).toString();
+
+      console.log("[inline-img] found:", imageUrl);
+
+      // 1. 读取当前书源配置的 header + 登录 header
+      const headers = await resolveSourceRequestHeaders(source, {
+        baseUrl: normalizeBookSourceBaseUrl(baseUrl),
+        host,
+        logs,
+      });
+
+      // 2. 图片请求补 Referer
+      //
+      // 对图片防盗链站点，这个非常重要。
+      // Referer 应该是当前章节页面，而不是图片 URL。
+      if (!headers["Referer"] && !headers["referer"]) {
+        headers["Referer"] = baseUrl;
+      }
+
+      // 3. 没有 User-Agent 时补浏览器 UA
+      if (!headers["User-Agent"] && !headers["user-agent"]) {
+        headers["User-Agent"] =
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+          "AppleWebKit/537.36 (KHTML, like Gecko) " +
+          "Chrome/120.0.0.0 Safari/537.36";
+      }
+
+      // 4. 图片 Accept
+      if (!headers["Accept"] && !headers["accept"]) {
+        headers["Accept"] =
+          "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8";
+      }
+
+      // 5. 如果书源启用了 CookieJar，把已有 cookie 一起带过去
+      if (source.enabledCookieJar) {
+        const cookie = cookieHeaderForUrl(imageUrl);
+
+        if (cookie) {
+          headers["Cookie"] = headers["Cookie"]
+            ? `${headers["Cookie"]}; ${cookie}`
+            : cookie;
+        }
+      }
+
+      console.log("[inline-img] request:", {
+        url: imageUrl,
+        referer: headers["Referer"] ?? headers["referer"],
+        hasCookie: Boolean(headers["Cookie"] ?? headers["cookie"]),
+      });
+
+      const response = await fetchBinaryViaChromiumSession({
+        url: imageUrl,
+        headers,
+        useCookieJar: source.enabledCookieJar,
+        redirect: "follow",
+        timeoutMs: 15_000,
+      });
+
+      console.log("[inline-img] response:", {
+        status: response.statusCode,
+        contentType:
+          response.headers["content-type"] ??
+          response.headers["Content-Type"],
+        bytes: response.body.length,
+        finalUrl: response.url,
+      });
+
+      if (
+        response.statusCode < 200 ||
+        response.statusCode >= 300
+      ) {
+        console.warn(
+          "[inline-img] download failed:",
+          response.statusCode,
+          imageUrl,
+        );
+
+        continue;
+      }
+
+      const buffer = response.body;
+
+      if (buffer.length < 16) {
+        console.warn("[inline-img] image too small:", imageUrl);
+        continue;
+      }
+
+      // 7. Electron 解码图片
+      const image = nativeImage.createFromBuffer(buffer);
+
+      if (image.isEmpty()) {
+        console.warn("[inline-img] invalid image:", imageUrl);
+        continue;
+      }
+
+      const { width, height } = image.getSize();
+
+      const area = width * height;
+      const ratio = height > 0 ? width / height : 999;
+
+      // 先保持之前的候选字图片判断
+      const isPossibleCharacter =
+        width > 0 &&
+        height > 0 &&
+        width <= 80 &&
+        height <= 80 &&
+        area <= 4096 &&
+        ratio >= 0.3 &&
+        ratio <= 3;
+
+      console.log("[inline-img]", {
+        url: imageUrl,
+        width,
+        height,
+        area,
+        ratio: Number(ratio.toFixed(2)),
+        bytes: buffer.length,
+        possibleCharacter: isPossibleCharacter,
+      });
+      
+      // ocr
+      if (isPossibleCharacter) {
+        const character =
+          await recognizeInlineCharacter(
+            imageUrl,
+            image,
+          );
+
+        if (character) {
+          console.log(
+            "[inline-img] OCR replace:",
+            imageUrl,
+            "success",
+          );
+
+          const beforeReplace = result;
+
+          result = result.replaceAll(
+            fullTag,
+            character,
+          );
+
+          console.log(
+            "[inline-img] replacement succeeded:",
+            result !== beforeReplace,
+          );
+
+        } else {
+          console.warn(
+            "[inline-img] OCR failed, keep original:",
+            imageUrl,
+          );
+
+          /*
+          * 测试阶段 OCR 失败什么都不改。
+          *
+          * 不再 normalized。
+          */
+        }
+      }
+
+    } catch (error) {
+      console.warn(
+        "[inline-img] process failed:",
+        rawSrc,
+        error,
+      );
+
+      logs.push(
+        `[inline-img] 图片处理失败: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  return result;
+}
+// sophie}
 
 export async function getChapterList(
   source: BookSourceRecord,
@@ -2550,6 +2778,18 @@ export async function getChapterContent(
 
   if (rule.replaceRegex?.trim()) {
     content = await applyContentReplaceRegex(ar, content, rule.replaceRegex);
+  }
+
+  // sophie
+  if (/<img\b/i.test(content)) {
+    console.log(
+      "[inline-img] remains after source replaceRegex:",
+      content.match(/<img\b[^>]*>/gi),
+    );
+  } else {
+    console.log(
+      "[inline-img] source replaceRegex resolved images",
+    );
   }
 
   if (titleRule) {

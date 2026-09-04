@@ -291,3 +291,93 @@ async function fetchViaChromiumSession(opts: {
   const res = await ses.fetch(opts.url, init);
   return decodeFetchResult(opts.url, res, opts.charset);
 }
+
+// sophie
+export type ChromiumBinaryFetchResult = {
+  url: string;
+  body: Buffer;
+  statusCode: number;
+  statusMessage?: string;
+  headers: Record<string, string>;
+};
+
+/**
+ * 二进制资源直接走 Electron Chromium session.fetch。
+ *
+ * 用于图片等不能经过文本解码的资源，同时绕过部分站点
+ * 对 Node/undici TLS 指纹的限制。
+ */
+export async function fetchBinaryViaChromiumSession(opts: {
+  url: string;
+  headers?: Record<string, string>;
+  timeoutMs?: number;
+  proxy?: string | null;
+  useCookieJar?: boolean;
+  redirect?: RequestRedirect;
+  signal?: AbortSignal;
+}): Promise<ChromiumBinaryFetchResult> {
+  const headers = sanitizeBookSourceRequestHeaders({
+    ...(opts.headers ?? {}),
+  });
+
+  if (!headers["User-Agent"] && !headers["user-agent"]) {
+    headers["User-Agent"] =
+      getWebViewUserAgent() || DEFAULT_BOOK_SOURCE_USER_AGENT;
+  }
+
+  if (
+    opts.useCookieJar &&
+    !headers.Cookie?.trim() &&
+    !headers.cookie?.trim()
+  ) {
+    const cookie = cookieHeaderForUrl(opts.url);
+
+    if (cookie) {
+      headers.Cookie = cookie;
+    }
+  }
+
+  const init: RequestInit = {
+    method: "GET",
+    headers,
+    redirect: opts.redirect ?? "follow",
+
+    // 非常重要：
+    // 显式 Cookie 由 ColorTxt CookieJar 控制，
+    // 不让 Chromium 自己的 session Cookie 覆盖。
+    credentials: "omit",
+
+    cache: "no-store",
+
+    referrerPolicy: "unsafe-url",
+
+    signal: combineAbortSignals(
+      AbortSignal.timeout(opts.timeoutMs ?? 20_000),
+      opts.signal,
+    ),
+  };
+
+  const { ses, proxyReady } = getBookSourceNetSession(opts.proxy);
+
+  await proxyReady;
+
+  const res = await ses.fetch(opts.url, init);
+
+  const body = Buffer.from(await res.arrayBuffer());
+
+  if (body.length > MAX_BYTES) {
+    throw new Error(
+      `HTTP 二进制响应过大 (${body.length} > ${MAX_BYTES})`,
+    );
+  }
+
+  applySetCookieFromResponse(opts.url, res);
+
+  return {
+    url: res.url || opts.url,
+    body,
+    statusCode: res.status,
+    statusMessage: res.statusText,
+    headers: collectResponseHeaders(res),
+  };
+}
